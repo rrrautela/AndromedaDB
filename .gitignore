@@ -1,0 +1,12 @@
+# IntelliJ
+.idea/
+
+# Build output
+out/
+
+# Java compiled files
+*.class
+
+# Database/runtime files
+*.db
+*.txt
