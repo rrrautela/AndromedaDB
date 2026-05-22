@@ -1,25 +1,81 @@
 import java.io.*;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Random;
 import java.util.TreeMap;
 
 public class Main {
+
+    static class BloomFilter {
+
+        // Compact binary bitmap storing Bloom Filter hash footprints efficiently in RAM
+        BitSet bitSet;
+        // Total size of bit array
+        int size;
+
+        public BloomFilter(int size) {
+            this.size = size;
+            // Java BitSet internally manages bits efficiently
+            this.bitSet = new BitSet(size);
+        }
+
+        // Insert key into Bloom Filter
+        public void add(long key) {
+
+            int hash1 = hash1(key);
+            int hash2 = hash2(key);
+            int hash3 = hash3(key);
+
+            // Mark all hash positions as 1
+            bitSet.set(hash1);
+            bitSet.set(hash2);
+            bitSet.set(hash3);
+        }
+
+        // Check if key might exist
+        public boolean mightContain(long key) {
+            int hash1 = hash1(key);
+            int hash2 = hash2(key);
+            int hash3 = hash3(key);
+
+            // If ANY required bit is missing, key definitely does not exist
+            // (all need to be 1, even one of them is 0 -> not present key)
+            return bitSet.get(hash1) && bitSet.get(hash2) && bitSet.get(hash3);
+        }
+
+        // First hash function
+        private int hash1(long key) {
+            return Math.abs(Long.hashCode(key)) % size;
+        }
+
+        // Second hash function
+        private int hash2(long key) {
+            return Math.abs(Long.hashCode(key * 31)) % size;
+        }
+
+        // Third hash function
+        private int hash3(long key) {
+            return Math.abs(Long.hashCode(key * 97)) % size;
+        }
+    }
 
     static class SparseIndexEntry {
 
         long firstKey;
         long lastKey;
         String fileName;
+        BloomFilter bloomFilter;
 
-        public SparseIndexEntry(long firstKey,
-                                long lastKey,
-                                String fileName) {
+        public SparseIndexEntry(long firstKey, long lastKey, String fileName, BloomFilter bloomFilter) {
 
             this.firstKey = firstKey;
             this.lastKey = lastKey;
             this.fileName = fileName;
+            this.bloomFilter = bloomFilter;
         }
     }
+
+    // Probabilistic structure used to avoid unnecessary SSTable scans
 
     // Stores small RAM metadata for every SSTable
     static ArrayList<SparseIndexEntry> sparseIndex = new ArrayList<>();
@@ -115,10 +171,7 @@ public class Main {
     public static void flushMemTable(TreeMap<Long, String> memTable) throws IOException {
 
         // Generate unique SSTable filename for every flush
-        // Example:
-        // data_1.db
-        // data_2.db
-        // data_3.db
+        // Example: data_1.db, data_2.db, data_3.db
         String fileName = "data_" + sstableCounter + ".db";
 
         // Create brand new immutable SSTable file
@@ -133,24 +186,19 @@ public class Main {
         // Wrapper stream for primitive writes
         DataOutputStream dos = new DataOutputStream(fos);
 
+        BloomFilter bloomFilter = new BloomFilter(1000);
         // TreeMap is already sorted by key
         for (Long key : memTable.keySet()) {
             // Serialize sorted entry into SSTable
             writeEntry(key, memTable.get(key), dos);
+            bloomFilter.add(key);
         }
 
         // Close streams
         dos.close();
 
-
         // Small RAM metadata describing SSTable boundaries
-        sparseIndex.add(
-                new SparseIndexEntry(
-                        memTable.firstKey(),
-                        memTable.lastKey(),
-                        fileName
-                )
-        );
+        sparseIndex.add(new SparseIndexEntry(memTable.firstKey(), memTable.lastKey(), fileName, bloomFilter));
         // Clear RAM after successful flush
         memTable.clear();
         // WAL no longer needed after durable flush
@@ -184,6 +232,12 @@ public class Main {
             // Skip SSTables whose key range cannot possibly contain target key
             if (targetKey < entry.firstKey || targetKey > entry.lastKey) {
                 System.out.println("Skipping " + entry.fileName);
+                continue;
+            }
+
+            // Bloom Filter says key definitely does not exist
+            if (!entry.bloomFilter.mightContain(targetKey)) {
+                System.out.println("Bloom Filter skipped " + entry.fileName);
                 continue;
             }
 
@@ -266,8 +320,13 @@ public class Main {
                 continue;
             }
 
+            //bloom filter built during bootstrap
+            BloomFilter bloomFilter = new BloomFilter(1000);
+
             // First key of SSTable
             long firstKey = dis.readLong();
+            //insert first key to bloom filter
+            bloomFilter.add(firstKey);
             // Read value size metadata
             int valueLength = dis.readInt();
             // Allocate byte array for value
@@ -282,6 +341,8 @@ public class Main {
 
                 // Read next key in SSTable
                 long key = dis.readLong();
+                //insert key into bloom filter
+                bloomFilter.add(key);
                 valueLength = dis.readInt();
                 valueBytes = new byte[valueLength];
                 dis.readFully(valueBytes);
@@ -290,13 +351,7 @@ public class Main {
             }
 
             // Restore sparse metadata into RAM
-            sparseIndex.add(
-                    new SparseIndexEntry(
-                            firstKey,
-                            lastKey,
-                            fileName
-                    )
-            );
+            sparseIndex.add(new SparseIndexEntry(firstKey, lastKey, fileName, bloomFilter));
 
             // Close SSTable stream
             dis.close();
@@ -367,11 +422,7 @@ public class Main {
         // Close WAL stream
         dis.close();
 
-        System.out.println(
-                "Recovered " +
-                        recoveredOperations +
-                        " operations from WAL"
-        );
+        System.out.println("Recovered " + recoveredOperations + " operations from WAL");
     }
 
     public static void clearWAL() throws IOException {
@@ -402,29 +453,29 @@ public class Main {
         long start = System.currentTimeMillis();
 
         // Insert 5000 records into Memtable (RAM only)
-        for (long i = 1; i <= 5000; i++) {
-
-            StringBuilder sb = new StringBuilder();
-
-            // Generate random 10-character value
-            for (int j = 0; j < 10; j++) {
-
-                int randomIndex = rand.nextInt(chars.length());
-
-                sb.append(chars.charAt(randomIndex));
-            }
-
-            // Store inside Memtable instead of disk
-            // Random key between 1 and 5000
-            Long keyy = (long) (rand.nextInt(5000) + 1);
-            appendToWAL(keyy, sb.toString());
-            memTable.put(keyy, sb.toString());
-
-            // Flush when Memtable reaches threshold
-            if (memTable.size() >= 10) {
-                flushMemTable(memTable);
-            }
-        }
+//        for (long i = 1; i <= 5000; i++) {
+//
+//            StringBuilder sb = new StringBuilder();
+//
+//            // Generate random 10-character value
+//            for (int j = 0; j < 10; j++) {
+//
+//                int randomIndex = rand.nextInt(chars.length());
+//
+//                sb.append(chars.charAt(randomIndex));
+//            }
+//
+//            // Store inside Memtable instead of disk
+//            // Random key between 1 and 5000
+//            Long keyy = (long) (rand.nextInt(5000) + 1);
+//            appendToWAL(keyy, sb.toString());
+//            memTable.put(keyy, sb.toString());
+//
+//            // Flush when Memtable reaches threshold
+//            if (memTable.size() >= 10) {
+//                flushMemTable(memTable);
+//            }
+//        }
 
         long end = System.currentTimeMillis();
 
@@ -433,8 +484,9 @@ public class Main {
             flushMemTable(memTable);
         }
 
-//        lets try finding it in all SSTables
+        //let's try finding it in all SSTables
         System.out.println(get(100, memTable));
+        System.out.println(get(1000000, memTable));
 
 
         //memtable is empty now so no need for thi code:
