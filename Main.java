@@ -3,6 +3,7 @@ import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Main {
 
@@ -59,6 +60,17 @@ public class Main {
         }
     }
 
+    // Represents one SSTable record currently pointed to by a stream
+    static class Entry {
+        Long key;
+        String value;
+
+        public Entry(Long key, String value) {
+            this.key = key;
+            this.value = value;
+        }
+    }
+
     static class SparseIndexEntry {
 
         long firstKey;
@@ -84,6 +96,8 @@ public class Main {
 
     static final String WAL_FILE = "wal.log";
 
+    static final String TOMBSTONE =  "__DELETED__";
+
     public static void writeEntry(long key, String value, DataOutputStream dos) throws IOException {
         dos.writeLong(key);
         byte[] valueBytes = value.getBytes();
@@ -91,39 +105,24 @@ public class Main {
         dos.write(valueBytes);
     }
 
-    public static void readEntry() throws IOException {
+    // Reads the next SSTable entry from disk
+    // Returns null when end-of-file is reached
+    public static Entry readNextEntry(DataInputStream dis) throws IOException {
 
-        // Open binary database file for reading
-        FileInputStream fis = new FileInputStream("binary.db");
+        if(dis.available() <= 0)
+            return null;
 
-        // Wrapper stream to easily read primitive data types
-        // (Decorator Pattern: DataInputStream wraps FileInputStream)
-        DataInputStream dis = new DataInputStream(fis);
+        long key = dis.readLong();
 
-        while (dis.available() > 0) {
-            // Read fixed-size 8-byte long key
-            long key = dis.readLong();
+        int valueLength = dis.readInt();
 
-            // Read next 4 bytes -> tells how many bytes value occupies
-            int valueLength = dis.readInt();
+        byte[] valueBytes = new byte[valueLength];
 
-            // Create byte array to hold upcoming value bytes
-            byte[] valueBytes = new byte[valueLength];
+        dis.readFully(valueBytes);
 
-            // Read exact number of bytes into array
-            dis.readFully(valueBytes);
+        String value = new String(valueBytes);
 
-            // Convert raw bytes back into readable String
-            String value = new String(valueBytes);
-
-            // Print reconstructed key-value pair
-            System.out.println("Key: " + key);
-            System.out.println("Value: " + value);
-            System.out.println("----------------");
-        }
-
-        // Closing outer wrapper stream also closes inner stream
-        dis.close();
+        return new Entry(key, value);
     }
 
     public static void rangeQuery(long startKey, long endKey) throws IOException {
@@ -215,6 +214,10 @@ public class Main {
         if (memTable.containsKey(targetKey)) {
 
             System.out.println("Found in Memtable");
+
+            if(memTable.get(targetKey).equals(TOMBSTONE))
+                return null; //key is in map but its deleet dso it should nt hav enay value
+
             return memTable.get(targetKey);
         }
 
@@ -278,6 +281,9 @@ public class Main {
                     System.out.println("Found in " + fileName);
 
                     // Newest matching value found
+                    if(value.equals(TOMBSTONE))
+                        return null;
+
                     return value;
                 }
             }
@@ -437,6 +443,105 @@ public class Main {
         System.out.println("WAL cleared");
     }
 
+    public static void compact(String olderFile, String newerFile, String outputFile) throws IOException {
+
+        // Open older SSTable
+        DataInputStream oldDis =
+                new DataInputStream(new FileInputStream(olderFile));
+
+        // Open newer SSTable
+        DataInputStream newDis =
+                new DataInputStream(new FileInputStream(newerFile));
+
+        // Output SSTable produced after compaction
+        DataOutputStream dos =
+                new DataOutputStream(new FileOutputStream(outputFile));
+
+        // Initial pointers (equivalent to i = 0, j = 0)
+        Entry oldEntry = readNextEntry(oldDis);
+        Entry newEntry = readNextEntry(newDis);
+
+        // Merge phase
+        while(oldEntry != null && newEntry != null){
+
+            // Older key comes first
+            if(oldEntry.key < newEntry.key){
+
+                if(!oldEntry.value.equals(TOMBSTONE))
+                    writeEntry(oldEntry.key, oldEntry.value, dos);
+
+                // i++
+                oldEntry = readNextEntry(oldDis);
+            }
+
+            // Newer key comes first
+            else if(newEntry.key < oldEntry.key){
+
+                if(!newEntry.value.equals(TOMBSTONE))
+                    writeEntry(newEntry.key, newEntry.value, dos);
+
+                // j++
+                newEntry = readNextEntry(newDis);
+            }
+
+            // Same key exists in both SSTables
+            else{
+
+                // Newer SSTable wins
+                if(!newEntry.value.equals(TOMBSTONE))
+                    writeEntry(newEntry.key, newEntry.value, dos);
+
+                // i++, j++
+                oldEntry = readNextEntry(oldDis);
+                newEntry = readNextEntry(newDis);
+            }
+        }
+
+        // Drain remaining entries from older SSTable
+        while(oldEntry != null){
+
+            if(!oldEntry.value.equals(TOMBSTONE))
+                writeEntry(oldEntry.key, oldEntry.value, dos);
+
+            oldEntry = readNextEntry(oldDis);
+        }
+
+        // Drain remaining entries from newer SSTable
+        while(newEntry != null){
+
+            if(!newEntry.value.equals(TOMBSTONE))
+                writeEntry(newEntry.key, newEntry.value, dos);
+
+            newEntry = readNextEntry(newDis);
+        }
+
+        // Cleanup
+        oldDis.close();
+        newDis.close();
+        dos.close();
+    }
+
+    public static void delete(long key, TreeMap<Long, String> memTable) throws IOException{
+        appendToWAL(key, TOMBSTONE);
+        memTable.put(key, TOMBSTONE);
+    }
+
+    public static void printFile(String fileName) throws IOException {
+//        to print all entrie sof  a file
+        System.out.println("\n===== " + fileName + " =====");
+        DataInputStream dis = new DataInputStream(new FileInputStream(fileName));
+        Entry entry;
+
+        while((entry = readNextEntry(dis)) != null){
+            System.out.println(
+                    entry.key + " -> " + entry.value
+            );
+        }
+        dis.close();
+
+        System.out.println("====================\n");
+    }
+
     public static void main(String[] args) throws IOException {
 
         bootstrapSparseIndex();
@@ -453,29 +558,29 @@ public class Main {
         long start = System.currentTimeMillis();
 
         // Insert 5000 records into Memtable (RAM only)
-//        for (long i = 1; i <= 5000; i++) {
-//
-//            StringBuilder sb = new StringBuilder();
-//
-//            // Generate random 10-character value
-//            for (int j = 0; j < 10; j++) {
-//
-//                int randomIndex = rand.nextInt(chars.length());
-//
-//                sb.append(chars.charAt(randomIndex));
-//            }
-//
-//            // Store inside Memtable instead of disk
-//            // Random key between 1 and 5000
-//            Long keyy = (long) (rand.nextInt(5000) + 1);
-//            appendToWAL(keyy, sb.toString());
-//            memTable.put(keyy, sb.toString());
-//
-//            // Flush when Memtable reaches threshold
-//            if (memTable.size() >= 10) {
-//                flushMemTable(memTable);
-//            }
-//        }
+        for (long i = 1; i <= 5000; i++) {
+
+            StringBuilder sb = new StringBuilder();
+
+            // Generate random 10-character value
+            for (int j = 0; j < 10; j++) {
+
+                int randomIndex = rand.nextInt(chars.length());
+
+                sb.append(chars.charAt(randomIndex));
+            }
+
+            // Store inside Memtable instead of disk
+            // Random key between 1 and 5000
+            Long keyy = (long) (rand.nextInt(5000) + 1);
+            appendToWAL(keyy, sb.toString());
+            memTable.put(keyy, sb.toString());
+
+            // Flush when Memtable reaches threshold
+            if (memTable.size() >= 10) {
+                flushMemTable(memTable);
+            }
+        }
 
         long end = System.currentTimeMillis();
 
@@ -489,18 +594,20 @@ public class Main {
         System.out.println(get(1000000, memTable));
 
 
-        //memtable is empty now so no need for thi code:
-//        System.out.println("Memtable write complete");
-//        System.out.println("Time Taken: " + (end - start) + " ms");
-//
-//        System.out.println();
-//
-//        // Print all sorted key-value pairs
-//        for (Long key : memTable.keySet()) {
-//
-//            System.out.println("Key: " + key);
-//            System.out.println("Value: " + memTable.get(key));
-//            System.out.println("----------------");
-//        }
+        //testing for compaction
+        printFile("data_1.db");
+
+        printFile("data_2.db");
+
+        compact(
+                "data_1.db",
+                "data_2.db",
+                "compacted.db"
+        );
+
+        printFile("compacted.db");
+
+
+
     }
 }
