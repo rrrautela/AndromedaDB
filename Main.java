@@ -2,11 +2,17 @@ import java.io.*;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Random;
-import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Main {
 
+    // Probabilistic structure used to avoid unnecessary SSTable scans
     static class BloomFilter {
 
         // Compact binary bitmap storing Bloom Filter hash footprints efficiently in RAM
@@ -87,16 +93,51 @@ public class Main {
         }
     }
 
-    // Probabilistic structure used to avoid unnecessary SSTable scans
-
     // Stores small RAM metadata for every SSTable
     static ArrayList<SparseIndexEntry> sparseIndex = new ArrayList<>();
 
     static int sstableCounter = 1;
 
-    static final String WAL_FILE = "wal.log";
+    static int compactionCounter = 1;
+
+    // Prevent duplicate compaction jobs from being queued
+    static AtomicBoolean compactionRunning =
+            new AtomicBoolean(false);
+
+    // Current WAL segment receiving writes
+    static int currentWalSegment = 1;
+
+    // Active WAL stream kept open for fast appends
+    static DataOutputStream currentWalDos;
 
     static final String TOMBSTONE =  "__DELETED__";
+
+    // Example: wal_1.log, wal_2.log ...
+    static String getWalFileName(int segmentId) {
+        return "wal_" + segmentId + ".log";
+    }
+
+
+    // Open a new WAL segment for incoming writes
+    public static void openWalSegment(int segmentId) throws IOException {
+
+        currentWalDos = new DataOutputStream(
+                new FileOutputStream(
+                        getWalFileName(segmentId),
+                        true
+                )
+        );
+    }
+
+
+
+    // Background SSTable flushes
+    static ExecutorService flushExecutor =
+            Executors.newSingleThreadExecutor();
+
+    // Background compactions
+    static ExecutorService compactionExecutor =
+            Executors.newSingleThreadExecutor();
 
     public static void writeEntry(long key, String value, DataOutputStream dos) throws IOException {
         dos.writeLong(key);
@@ -167,7 +208,14 @@ public class Main {
         dis.close();
     }
 
-    public static void flushMemTable(TreeMap<Long, String> memTable) throws IOException {
+    public static void flushMemTable(ConcurrentSkipListMap<Long, String> memTable,
+                                    int walSegmentId) throws IOException {
+
+        // Shows which thread is performing the flush
+        System.out.println(
+                "[" + Thread.currentThread().getName() + "] Writing SSTable with "
+                        + memTable.size() + " entries"
+        );
 
         // Generate unique SSTable filename for every flush
         // Example: data_1.db, data_2.db, data_3.db
@@ -186,7 +234,7 @@ public class Main {
         DataOutputStream dos = new DataOutputStream(fos);
 
         BloomFilter bloomFilter = new BloomFilter(1000);
-        // TreeMap is already sorted by key
+        // ConcurrentSkipListMap is already sorted by key
         for (Long key : memTable.keySet()) {
             // Serialize sorted entry into SSTable
             writeEntry(key, memTable.get(key), dos);
@@ -197,16 +245,65 @@ public class Main {
         dos.close();
 
         // Small RAM metadata describing SSTable boundaries
-        sparseIndex.add(new SparseIndexEntry(memTable.firstKey(), memTable.lastKey(), fileName, bloomFilter));
-        // Clear RAM after successful flush
-        memTable.clear();
-        // WAL no longer needed after durable flush
-        clearWAL();
+        synchronized (sparseIndex) {
+            sparseIndex.add(
+                    new SparseIndexEntry(
+                            memTable.firstKey(),
+                            memTable.lastKey(),
+                            fileName,
+                            bloomFilter
+                    )
+            );
+        }
+        // This memtable will become unreachable after flush finishes.
+        // Let the Garbage Collector reclaim it naturally.
 
-        System.out.println("Memtable flushed to " + fileName);
+        // This Memtable's WAL segment is now durable
+        deleteWalSegment(walSegmentId);
+
+        System.out.println(
+                "[" + Thread.currentThread().getName() + "] Memtable flushed to " + fileName
+        );
+
+        // Trigger background compaction when many SSTables exist
+
+        // Only one thread can successfully switch false -> true
+        boolean shouldCompact = false;
+
+        synchronized (sparseIndex) {
+            if (sparseIndex.size() >= 4
+                    && compactionRunning.compareAndSet(false, true)) {
+                shouldCompact = true;
+            }
+        }
+
+        if (shouldCompact) {
+                compactionExecutor.submit(() -> {
+
+
+                System.out.println(
+                        "[" + Thread.currentThread().getName()
+                                + "] Starting background compaction"
+                );
+
+                try {
+
+                    compactAllSSTables();
+
+                } catch (IOException e) {
+
+                    throw new RuntimeException(e);
+
+                } finally {
+
+                    // Allow future compactions
+                    compactionRunning.set(false);
+                }
+            });
+        }
     }
 
-    public static String get(long targetKey, TreeMap<Long, String> memTable) throws IOException {
+    public static String get(long targetKey, ConcurrentSkipListMap<Long, String> memTable) throws IOException {
 
         // STEP 1:
         // Check Memtable (RAM) first
@@ -373,74 +470,145 @@ public class Main {
 
     public static void appendToWAL(long key, String value) throws IOException {
 
-        // true = append mode
-        FileOutputStream fos = new FileOutputStream(WAL_FILE, true);
-
-        // Wrapper stream for primitive writes
-        DataOutputStream dos = new DataOutputStream(fos);
-
-        // Append operation to WAL
-        writeEntry(key, value, dos);
-
-        // Push buffered bytes toward OS
-        dos.flush();
-
-        dos.close();
+        // Append directly to active WAL stream
+        writeEntry(key, value, currentWalDos);
+        currentWalDos.flush();
     }
 
-    public static void recoverFromWAL(TreeMap<Long, String> memTable) throws IOException {
-
-        // WAL file path reference
-        File walFile = new File(WAL_FILE);
-
-        // No WAL exists yet
-        if (!walFile.exists()) {
-            System.out.println("No WAL found");
-            return;
-        }
-
-        // Open WAL for replay
-        FileInputStream fis = new FileInputStream(WAL_FILE);
-        // Wrapper stream for primitive reads
-        DataInputStream dis = new DataInputStream(fis);
-
+    public static void recoverFromWAL(ConcurrentSkipListMap<Long, String> memTable) throws IOException {
         int recoveredOperations = 0;
 
-        // Replay operations sequentially
-        while (dis.available() > 0) {
+        // Replay every WAL segment that exists
 
-            // Read logged key
-            long key = dis.readLong();
-            // Read value size metadata
-            int valueLength = dis.readInt();
-            // Allocate byte array for value
-            byte[] valueBytes = new byte[valueLength];
-            // Read exact value bytes
-            dis.readFully(valueBytes);
-            // Convert bytes back into String
-            String value = new String(valueBytes);
+        // Scan all files in project directory
+        File[] files = new File(".").listFiles();
 
-            // Replay operation back into Memtable
-            memTable.put(key, value);
-            recoveredOperations++;
+        if (files != null) {
+
+            // Replay WAL segments in numeric order
+            Arrays.sort(files, Comparator.comparingInt(file -> {
+
+                String name = file.getName();
+
+                if (!name.startsWith("wal_") ||
+                        !name.endsWith(".log")) {
+                    return Integer.MAX_VALUE;
+                }
+
+                return Integer.parseInt(
+                        name.substring(4, name.length() - 4)
+                );
+            }));
+
+            for (File walFile : files) {
+
+                String name = walFile.getName();
+
+                if (!name.startsWith("wal_") ||
+                        !name.endsWith(".log")) {
+                    continue;
+                }
+
+                DataInputStream dis =
+                        new DataInputStream(new FileInputStream(walFile));
+
+                Entry entry;
+
+                while ((entry = readNextEntry(dis)) != null) {
+
+                    memTable.put(entry.key, entry.value);
+                    recoveredOperations++;
+                }
+
+                dis.close();
+            }
         }
 
-        // Close WAL stream
-        dis.close();
-
-        System.out.println("Recovered " + recoveredOperations + " operations from WAL");
+        System.out.println(
+                "Recovered " + recoveredOperations + " operations from WAL segments"
+        );
     }
 
-    public static void clearWAL() throws IOException {
+    // Delete WAL segment after its Memtable is safely flushed
+    public static void deleteWalSegment(int walSegmentId) {
 
-        // Opening without append mode truncates file to 0 bytes
-        FileOutputStream fos = new FileOutputStream(WAL_FILE);
+        File walFile = new File(
+                getWalFileName(walSegmentId)
+        );
 
-        // Close stream after clearing contents
-        fos.close();
+        if (walFile.exists()) {
+            walFile.delete();
+            System.out.println(
+                    "Deleted WAL segment: "
+                            + walFile.getName()
+            );
+        }
+    }
 
-        // WAL reset complete
-        System.out.println("WAL cleared");
+    public static int getMaxWalSegment() {
+        int maxWalSegment = 0;
+
+        File[] files = new File(".").listFiles();
+
+        if (files != null) {
+
+            for (File file : files) {
+
+                String name = file.getName();
+
+                if (!name.startsWith("wal_") ||
+                        !name.endsWith(".log")) {
+                    continue;
+                }
+
+                // Extract number from wal_7.log -> 7
+                String number =
+                        name.substring(4, name.length() - 4);
+
+                maxWalSegment =
+                        Math.max(maxWalSegment, Integer.parseInt(number));
+            }
+        }
+        return maxWalSegment;
+    }
+
+    // Rebuild SparseIndex metadata from an SSTable
+    public static SparseIndexEntry buildSparseIndexEntry(String fileName) throws IOException {
+
+        DataInputStream dis =
+                new DataInputStream(new FileInputStream(fileName));
+
+        Entry firstEntry = readNextEntry(dis);
+
+        if (firstEntry == null) {
+            dis.close();
+            return null;
+        }
+
+        long firstKey = firstEntry.key;
+        long lastKey = firstKey;
+
+        BloomFilter bloomFilter = new BloomFilter(1000);
+
+        // First key also belongs in Bloom Filter
+        bloomFilter.add(firstKey);
+
+        Entry entry;
+
+        while ((entry = readNextEntry(dis)) != null) {
+
+            bloomFilter.add(entry.key);
+            lastKey = entry.key;
+        }
+
+        dis.close();
+
+        return new SparseIndexEntry(
+                firstKey,
+                lastKey,
+                fileName,
+                bloomFilter
+        );
     }
 
     public static void compact(String olderFile, String newerFile, String outputFile) throws IOException {
@@ -519,9 +687,101 @@ public class Main {
         oldDis.close();
         newDis.close();
         dos.close();
+
+        // Remove old SSTables and register compacted SSTable atomically
+        synchronized (sparseIndex) {
+
+            sparseIndex.removeIf(
+                    entry ->
+                            entry.fileName.equals(olderFile)
+                                    || entry.fileName.equals(newerFile)
+            );
+
+            // Build metadata for compacted SSTable
+            SparseIndexEntry compactedEntry =
+                    buildSparseIndexEntry(outputFile);
+
+            // Register compacted SSTable
+            if (compactedEntry != null) {
+                sparseIndex.add(compactedEntry);
+            }
+        }
+
+        // Old SSTables no longer needed
+        new File(olderFile).delete();
+        new File(newerFile).delete();
+
+        System.out.println(
+                "Compaction completed: "
+                        + outputFile
+        );
     }
 
-    public static void delete(long key, TreeMap<Long, String> memTable) throws IOException{
+    // Merge all active SSTables into one final SSTable
+    public static void compactAllSSTables() throws IOException {
+
+        // Need at least 2 SSTables to compact
+        // Need at least 2 SSTables to compact
+        synchronized (sparseIndex) {
+
+            if (sparseIndex.size() < 2) {
+                System.out.println("Not enough SSTables to compact");
+                return;
+            }
+        }
+
+        // Keep compacting until only one SSTable remains
+        while (true) {
+
+            synchronized (sparseIndex) {
+
+                if (sparseIndex.size() <= 1) {
+                    break;
+                }
+            }
+            // Oldest SSTable
+            String olderFile;
+            //newest SSTable
+            String newerFile;
+
+            synchronized (sparseIndex) {
+
+                olderFile =
+                        sparseIndex.get(0).fileName;
+
+                newerFile =
+                        sparseIndex.get(1).fileName;
+            }
+
+            // Temporary output SSTable
+            String outputFile =
+                    "compacted_" + compactionCounter++ + ".db";
+
+            System.out.println(
+                    "Compacting "
+                            + olderFile
+                            + " + "
+                            + newerFile
+            );
+
+            // Reuse existing compaction logic
+            compact(
+                    olderFile,
+                    newerFile,
+                    outputFile
+            );
+        }
+
+        synchronized (sparseIndex) {
+
+            System.out.println(
+                    "Final SSTable: "
+                            + sparseIndex.get(0).fileName
+            );
+        }
+    }
+
+    public static void delete(long key, ConcurrentSkipListMap<Long, String> memTable) throws IOException{
         appendToWAL(key, TOMBSTONE);
         memTable.put(key, TOMBSTONE);
     }
@@ -547,9 +807,22 @@ public class Main {
         bootstrapSparseIndex();
 
         // Memtable = sorted in-memory buffer
-        TreeMap<Long, String> memTable = new TreeMap<>();
-
+        ConcurrentSkipListMap<Long, String> memTable = new ConcurrentSkipListMap<>();
         recoverFromWAL(memTable);
+
+        // Find highest WAL segment already present on disk
+        int maxWalSegment = getMaxWalSegment();
+
+        // New writes continue in the next WAL segment
+        currentWalSegment = maxWalSegment + 1;
+
+        // Open active WAL segment
+        openWalSegment(currentWalSegment);
+
+
+        System.out.println(
+                "Current WAL segment: " + currentWalSegment
+        );
 
         Random rand = new Random();
 
@@ -557,8 +830,11 @@ public class Main {
 
         long start = System.currentTimeMillis();
 
-        // Insert 5000 records into Memtable (RAM only)
-        for (long i = 1; i <= 5000; i++) {
+
+        // Insert 50k records into Memtable
+        int totalWrites = 50000;
+
+        for (long i = 1; i <= totalWrites; i++) {
 
             StringBuilder sb = new StringBuilder();
 
@@ -571,23 +847,127 @@ public class Main {
             }
 
             // Store inside Memtable instead of disk
-            // Random key between 1 and 5000
-            Long keyy = (long) (rand.nextInt(5000) + 1);
+            // Random key between 1 and 100000
+            Long keyy = (long) rand.nextInt(100000);
             appendToWAL(keyy, sb.toString());
             memTable.put(keyy, sb.toString());
 
-            // Flush when Memtable reaches threshold
-            if (memTable.size() >= 10) {
-                flushMemTable(memTable);
+            // Memtable full -> freeze current table
+            if (memTable.size() >= 1000) {
+
+                // Finish current WAL segment
+                currentWalDos.flush();
+                currentWalDos.close();
+
+                // WAL segment belonging to this frozen Memtable
+                int oldWalSegment = currentWalSegment;
+
+                // New writes go to a new WAL segment
+                currentWalSegment++;
+
+                // New writes go into a fresh WAL segment
+                openWalSegment(currentWalSegment);
+
+                ConcurrentSkipListMap<Long, String> oldMemTable = memTable;
+
+                // New active Memtable for incoming writes
+                memTable = new ConcurrentSkipListMap<>();
+
+                // Flush old Memtable in background
+                flushExecutor.submit(() -> {
+                    // Background worker picked up a flush job
+                    System.out.println(
+                            "[" + Thread.currentThread().getName() + "] Starting scheduled flush"
+                    );
+                    try {
+                        flushMemTable(oldMemTable, oldWalSegment);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
             }
         }
 
         long end = System.currentTimeMillis();
 
+        // Raw insert throughput measurement
+        System.out.println(
+                "\nInsert Time = "
+                        + (end - start)
+                        + " ms"
+        );
+
+        System.out.println(
+                "Writes/sec = "
+                        + (totalWrites * 1000.0) / (end - start)
+        );
+
         // Flush remaining entries still in RAM
         if (!memTable.isEmpty()) {
-            flushMemTable(memTable);
+
+            // Close final active WAL segment
+            currentWalDos.flush();
+            currentWalDos.close();
+
+            int oldWalSegment = currentWalSegment;
+
+            ConcurrentSkipListMap<Long, String> oldMemTable = memTable;
+
+            flushExecutor.submit(() -> {
+                // Background worker picked up the final flush
+                System.out.println(
+                        "[" + Thread.currentThread().getName() + "] Starting final flush"
+                );
+                try {
+                    flushMemTable(oldMemTable, oldWalSegment);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
         }
+        // No more background jobs will be submitted
+
+        // Main thread now waits for all background flushes
+        System.out.println("[main] Finished inserts. Waiting for background flushes...");
+
+
+
+        flushExecutor.shutdown();
+
+        try {
+            flushExecutor.awaitTermination(
+                    1,
+                    TimeUnit.MINUTES
+            );
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+
+        // Wait for background compactions
+        compactionExecutor.shutdown();
+
+        try {
+            compactionExecutor.awaitTermination(
+                    1,
+                    TimeUnit.MINUTES
+            );
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+
+        // Safe to read SSTables now
+        System.out.println("[main] All background flushes completed.");
+
+
+        System.out.println(
+                "Final SSTables = "
+                        + sparseIndex.size()
+        );
+
+        System.out.println(
+                "Final File = "
+                        + sparseIndex.get(0).fileName
+        );
 
         //let's try finding it in all SSTables
         System.out.println(get(100, memTable));
@@ -595,19 +975,32 @@ public class Main {
 
 
         //testing for compaction
-        printFile("data_1.db");
+//        printFile("data_1.db");
+//
+//        printFile("data_2.db");
 
-        printFile("data_2.db");
 
-        compact(
-                "data_1.db",
-                "data_2.db",
-                "compacted.db"
-        );
+//        //let's do compaction now
+//        compactAllSSTables();
+//
+//        // Show final remaining SSTable
+//        System.out.println(
+//                "Final SSTable = "
+//                        + sparseIndex.get(0).fileName
+//        );
+//
+//        System.out.println(
+//                "Active SSTables = "
+//                        + sparseIndex.size()
+//        );
 
-        printFile("compacted.db");
+//        printFile(
+//                sparseIndex.get(0).fileName
+//        );
 
 
 
     }
+
+
 }
