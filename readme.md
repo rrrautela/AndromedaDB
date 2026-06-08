@@ -4,7 +4,9 @@
 
 AndromedaDB is a write-optimized key-value database built to explore the core ideas behind modern storage engines such as RocksDB, Cassandra, and LevelDB.
 
-The project implements the complete lifecycle of data, from durable WAL writes and in-memory Memtables to immutable SSTables, Bloom Filter-based lookups, crash recovery, and background compaction, while achieving over **90,000 writes/sec** during benchmarking.
+The project implements the complete lifecycle of data, from durable WAL writes and in-memory Memtables to immutable SSTables, Bloom Filter-based lookups, crash recovery, and background compaction.
+
+**Benchmark:** ~99,000 writes/sec during a 500,000-write workload.
 
 ---
 
@@ -19,8 +21,8 @@ This project was built from scratch to explore storage-engine fundamentals inclu
 # Performance Highlights
 
 ```text
-~91,000 Writes/sec
-50,000 Write Benchmark
+~99,009 Writes/sec
+500,000 Write Benchmark
 Background Flush
 Background Compaction
 Segmented WAL Recovery
@@ -44,7 +46,7 @@ Segmented WAL Recovery
 - Background SSTable Compaction
 - AtomicBoolean-based compaction scheduling
 - Thread-safe metadata management
-- 90K+ writes/sec benchmark
+- 99K+ writes/sec benchmark
 
 ---
 
@@ -385,14 +387,14 @@ Protects shared metadata from concurrent modifications.
 Benchmark Configuration:
 
 ```text
-50,000 Writes
+500,000 Writes
 Memtable Size = 1000
 ```
 
 Results:
 
 ```text
-~91,000 Writes/sec
+~99,000 Writes/sec
 ```
 
 A major optimization involved keeping WAL segments open instead of opening and closing files for every write.
@@ -406,9 +408,21 @@ This improved throughput from roughly:
 to:
 
 ```text
-91,000 writes/sec
+99,009 writes/sec
 ```
 
+## Additional Stress Test Results
+
+```text
+500,000 Writes
+Insert Time = 5050 ms
+~99,000 Writes/sec
+500 WAL Segments Generated
+500 SSTables Generated
+Final SSTables = 1
+```
+
+This benchmark demonstrates sustained write ingestion while asynchronous flush and compaction operations execute in the background.
 ---
 
 # Technologies & Concepts
@@ -426,58 +440,91 @@ to:
 - Crash Recovery
 
 ---
-
-# Future Improvements
-
 # Design Decisions
 
 ## Why WAL Before Memtable?
 
 Durability.
 
-If the process crashes after a write, the WAL can be replayed to recover data.
+Every write is first recorded in the Write-Ahead Log before reaching memory. If the process crashes, WAL segments can be replayed to reconstruct lost Memtable state.
 
+## Why Bloom Filters?
+
+Disk I/O is expensive.
+
+Before scanning an SSTable, AndromedaDB first checks its Bloom Filter.
+
+The Bloom Filter can quickly determine whether a key is:
+
+- Definitely Not Present
+- Possibly Present
+
+If the Bloom Filter reports that a key is definitely not present, the SSTable is skipped entirely, avoiding unnecessary disk reads.
+
+Bloom Filters may produce false positives but never false negatives, making them an efficient way to reduce read amplification when many SSTables exist.
+ 
 ## Why Immutable SSTables?
 
-Immutable files eliminate update-in-place complexity and make compaction simpler.
+Immutable files eliminate update-in-place complexity, simplify crash recovery, and make background compaction possible without interfering with active writes.
+
 
 ## Why Background Flush?
 
-Writers should not wait for disk serialization.
+Serializing a Memtable to disk can be expensive. By flushing in a background thread, incoming writes continue with minimal latency.
 
 ## Why Background Compaction?
 
-Compaction is expensive and should not block incoming writes.
+Compaction rewrites and merges SSTables, making it one of the most expensive operations in an LSM-based system. Running it asynchronously prevents write stalls.
 
 ## Why ConcurrentSkipListMap?
 
-Provides a sorted, thread-safe Memtable implementation suitable for future range queries and concurrent access.
+ConcurrentSkipListMap provides:
 
-- Multi-Level Compaction (L0/L1/L2)
-- Sparse Index Offsets
-- Binary Search SSTables
-- SSTable Block Indexes
-- Compression
-- Distributed Replication
-- Consensus Protocol Integration
+- Sorted key ordering
+- Thread-safe access
+- Efficient inserts
+- Future support for range queries
+
+making it a natural fit for a Memtable implementation.
+
+---
+
+# Future Improvements
+
+The current implementation focuses on the core storage-engine building blocks used by modern LSM databases. Future enhancements could include:
+
+- Multi-Level Compaction (L0 → L1 → L2 → L3)
+- Sparse Index Offsets for direct SSTable seeks
+- Binary Search Within SSTables
+- Block-Based SSTable Indexes
+- SSTable Compression
 - Range Query Optimization
+- Multi-Threaded Compaction Pipelines
+- Distributed Replication
+- Consensus Protocol Integration (Raft/Paxos)
+- Metrics & Observability Dashboard
+- MVCC (Multi-Version Concurrency Control)
+- Read Caching Layer
+- Bloom Filter Tuning & Adaptive Sizing
 
 ---
 
 # Key Takeaway
 
-AndromedaDB demonstrates how modern write-optimized storage engines work internally by combining:
+AndromedaDB demonstrates the core ideas behind modern write-optimized storage engines by combining:
 
 ```text
-WAL
-+
+Write-Ahead Log (WAL)
+        +
 Memtable
-+
-SSTables
-+
+        +
+Immutable SSTables
+        +
 Bloom Filters
-+
-Compaction
+        +
+Background Flush
+        +
+Background Compaction
 ```
 
-to achieve durable and scalable storage.
+into a durable, scalable, and high-throughput storage engine capable of sustaining approximately **99,000 writes/sec during a 500,000-write benchmark** while performing asynchronous flush and compaction operations in the background.

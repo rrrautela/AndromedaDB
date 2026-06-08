@@ -832,7 +832,7 @@ public class Main {
 
 
         // Insert 50k records into Memtable
-        int totalWrites = 50000;
+        int totalWrites = 500000;
 
         for (long i = 1; i <= totalWrites; i++) {
 
@@ -848,7 +848,8 @@ public class Main {
 
             // Store inside Memtable instead of disk
             // Random key between 1 and 100000
-            Long keyy = (long) rand.nextInt(100000);
+//            Long keyy = (long) rand.nextInt(250000);
+            Long keyy  = i;
             appendToWAL(keyy, sb.toString());
             memTable.put(keyy, sb.toString());
 
@@ -897,10 +898,12 @@ public class Main {
                         + " ms"
         );
 
+        System.out.println();
         System.out.println(
                 "Writes/sec = "
                         + (totalWrites * 1000.0) / (end - start)
         );
+        System.out.println();
 
         // Flush remaining entries still in RAM
         if (!memTable.isEmpty()) {
@@ -936,7 +939,7 @@ public class Main {
 
         try {
             flushExecutor.awaitTermination(
-                    1,
+                    10,
                     TimeUnit.MINUTES
             );
         } catch (InterruptedException e) {
@@ -948,7 +951,7 @@ public class Main {
 
         try {
             compactionExecutor.awaitTermination(
-                    1,
+                    10,
                     TimeUnit.MINUTES
             );
         } catch (InterruptedException e) {
