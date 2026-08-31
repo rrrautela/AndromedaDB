@@ -1,530 +1,264 @@
 # AndromedaDB
 
-> A custom LSM Tree-inspired storage engine built from scratch in Java featuring WAL recovery, SSTables, Bloom Filters, asynchronous flushing, and background compaction.
+[![Java](https://img.shields.io/badge/Java-17%2B-orange?logo=openjdk)]()
+[![Status](https://img.shields.io/badge/status-learning%20project-blue)]()
+[![Storage Engine](https://img.shields.io/badge/type-LSM--style%20KV%20engine-purple)]()
 
-AndromedaDB is a write-optimized key-value database built to explore the core ideas behind modern storage engines such as RocksDB, Cassandra, and LevelDB.
+AndromedaDB is a compact Java key-value storage engine built from scratch to explore the core ideas behind LSM-style systems such as RocksDB, LevelDB, and Cassandra. The project is intentionally small, source-first, and implementation-focused: it writes to a WAL, stores ordered data in a memtable, flushes immutable SSTables, prunes reads with sparse key ranges and Bloom filters, and periodically compacts older files.
 
-The project implements the complete lifecycle of data, from durable WAL writes and in-memory Memtables to immutable SSTables, Bloom Filter-based lookups, crash recovery, and background compaction.
+> Observed benchmark result: 500,000 writes in roughly 5.05 seconds, or about 99,000 writes/sec in the project’s local benchmark run.
 
-**Benchmark:** ~99,000 writes/sec during a 500,000-write workload.
+## At a glance
 
----
-
-# Why I Built This
-
-I wanted to understand how modern databases such as RocksDB, Cassandra, and LevelDB work internally instead of treating them as black boxes.
-
-This project was built from scratch to explore storage-engine fundamentals including WALs, Memtables, SSTables, Bloom Filters, crash recovery, background flushing, and compaction.
-
----
-
-# Performance Highlights
-
-```text
-~99,009 Writes/sec
-500,000 Write Benchmark
-Background Flush
-Background Compaction
-Segmented WAL Recovery
-```
+| Area | Implementation |
+|---|---|
+| Language | Java |
+| Storage model | LSM-style key-value engine |
+| Core architecture | WAL → Memtable → SSTable → Compaction |
+| Durability mechanism | Write-ahead log plus replay on startup |
+| Concurrency model | `ConcurrentSkipListMap`, `ExecutorService`, `AtomicBoolean`, synchronized metadata access |
+| Benchmark result | ~99,000 writes/sec on the repo’s local benchmark |
 
 ---
 
-# Features
+## Overview
 
-- Segmented Write-Ahead Log (WAL)
-- Crash Recovery from WAL
-- ConcurrentSkipListMap-based Memtable
-- Immutable SSTables stored on disk
-- Bloom Filters for fast negative lookups
-- Sparse Index metadata
-- Tombstone-based deletes
-- Per-SSTable Bloom Filters
-- SSTable Key-Range Metadata
-- Binary File Storage Format
-- Background Memtable Flush
-- Background SSTable Compaction
-- AtomicBoolean-based compaction scheduling
-- Thread-safe metadata management
-- 99K+ writes/sec benchmark
+AndromedaDB is a learning-oriented storage engine project designed to make the internals of modern write-optimized databases concrete. Instead of treating WALs, memtables, SSTables, compaction, and Bloom filters as abstract concepts, this code implements them directly in Java using plain file I/O and standard library data structures.
+
+The overall goal is not to match production database maturity. It is to understand the runtime behavior, trade-offs, and structural decisions behind systems that prioritize fast append-heavy writes and cheap recovery.
 
 ---
 
-# High Level Architecture
+## What it implements
 
-```text
-                Write Request
-                      │
-                      ▼
-                Append To WAL
-                      │
-                      ▼
-                   Memtable
-                      │
-           (Threshold Reached)
-                      │
-                      ▼
-               Freeze Memtable
-                      │
-          ┌───────────┴───────────┐
-          │                       │
-          ▼                       ▼
- New Active Memtable      Background Flush
-                                   │
-                                   ▼
-                               SSTable
-                                   │
-                                   ▼
-                            Sparse Index
-                                   │
-                                   ▼
-                      Background Compaction
-                                   │
-                                   ▼
-                           Final SSTable
-```
+| Component | Status |
+|---|---|
+| Write-ahead log (WAL) | Implemented |
+| Memtable | Implemented via `ConcurrentSkipListMap<Long, String>` |
+| Immutable SSTables | Implemented |
+| Bloom filters | Implemented |
+| Sparse key-range metadata | Implemented |
+| Tombstones | Implemented as `__DELETED__` |
+| Background memtable flush | Implemented |
+| Background compaction | Implemented |
+| Crash recovery via WAL replay | Implemented |
+| Concurrent background scheduling | Implemented with executors and `AtomicBoolean` |
+
+This is best described as an LSM-inspired prototype rather than a production database implementation.
 
 ---
 
-# Write Path
+## Architecture
 
-## Step 1: Write-Ahead Log (WAL)
-
-Every write is first appended to a WAL segment.
-
-Example:
+The high-level flow in the project is straightforward:
 
 ```text
-PUT(100, "hello")
+Write
+  → WAL append
+  → Memtable insert
+  → Freeze on size threshold
+  → Background flush
+  → SSTable file
+  → Compaction of older SSTables
 ```
 
-gets recorded in:
+Reads follow a layered pattern:
 
 ```text
-wal_1.log
+GET
+  → Memtable lookup
+  → Sparse key-range filtering
+  → Bloom filter check
+  → SSTable scan (newest to oldest)
 ```
 
-This guarantees data can be recovered after crashes.
+This matches the actual implementation in `Main.java`, `StorageEngine.java`, `WriteAheadLog.java`, `SSTable.java`, and `Compactor.java`.
 
 ---
 
-## Step 2: Memtable
+## Write path
 
-After WAL append, data is inserted into an in-memory sorted structure:
+The write path is intentionally simple and follows the project’s code flow:
 
-```java
-ConcurrentSkipListMap<Long, String>
-```
+1. A value is generated in `Main.main()`.
+2. The engine appends the key/value pair to the active WAL using `engine.appendToWAL(...)`.
+3. The same key/value is written into the active in-memory memtable using `memTable.put(...)`.
+4. When `memTable.size() >= 1000`, the active WAL is flushed and closed, a fresh WAL segment is opened, and the old memtable is swapped out.
+5. The frozen memtable is submitted to the background flush executor.
+6. `SSTable.flushMemTable()` creates a new `data_<n>.db` file, serializes the sorted entries, builds a Bloom filter, updates sparse metadata, and removes the WAL segment associated with that memtable.
 
-Benefits:
-
-- Sorted keys
-- Fast writes
-- Range scan friendly
-- Thread-safe
+This is a classic LSM-style write batching pattern: append quickly, then persist to disk asynchronously.
 
 ---
 
-## Step 3: Memtable Freeze
+## Read path
 
-When the Memtable reaches its configured threshold:
+Reads in `StorageEngine.get(...)` are ordered to minimize unnecessary disk I/O:
 
-```text
-1000 entries
-```
+1. Check the active memtable first.
+2. Search SSTables from newest to oldest.
+3. Skip any SSTable whose key range cannot possibly contain the target key.
+4. Use the SSTable’s Bloom filter to reject keys that are definitely absent.
+5. Only if the key remains plausible do a sequential scan of the file.
 
-the engine performs a Memtable swap:
+This gives the project a cheap pre-filtering strategy while keeping the actual lookup logic simple and readable.
 
-```java
-oldMemTable = memTable;
-memTable = new ConcurrentSkipListMap<>();
-```
-
-This allows new writes to continue immediately.
+> The Bloom filter is probabilistic: it can produce false positives, but it does not produce false negatives in the implementation.
 
 ---
 
-## Step 4: Background Flush
+## Compaction
 
-The frozen Memtable is handed to a background thread.
+Compaction is triggered once the sparse index reaches a threshold (`sparseIndex.size() >= 4` in the flush logic). The implementation then repeatedly merges the oldest and newest SSTables with `Compactor.compact(...)` and continues until a single SSTable remains, or until there are no more files to merge.
 
-That thread converts it into an immutable SSTable on disk.
-
-Example:
+The merge logic is pairwise and simple:
 
 ```text
-data_1.db
-data_2.db
-data_3.db
+olderFile + newerFile -> compacted output
 ```
+
+It preserves the newest value for any duplicate key and drops tombstones when they are merged away. A delete is represented as a tombstone value, `__DELETED__`, which ensures stale values are superseded by newer writes before the old value is physically discarded during compaction.
+
+This is an educational implementation of compaction, not a production multi-level LSM compaction engine.
 
 ---
 
-# Read Path
+## Crash recovery
 
-When a key is requested:
+On restart, the engine rebuilds its in-memory state by replaying WAL files from disk. `WriteAheadLog.recoverFromWAL(...)` scans files named like `wal_<n>.log`, sorts them numerically, and replays each record into a fresh `ConcurrentSkipListMap`.
 
-```text
-GET(key)
-```
+This restores the state from recent writes before new work begins. The project’s crash-recovery model is therefore WAL-driven recovery, not a fully durable storage protocol with fsync semantics or a manifest-based commit log.
 
-AndromedaDB performs:
-
-## 1. Memtable Lookup
-
-Check active Memtable first.
+This project is intentionally transparent about the trade-off: it uses WAL replay to reconstruct recent state, but it does not use `fsync` or a more robust persistent write protocol in the implementation shown here.
 
 ---
 
-## 2. Sparse Index Filtering
+## Concurrency
 
-Identify SSTables whose key range may contain the key.
+The project uses a lightweight concurrency model rather than a fully general-purpose storage-engine synchronization system.
 
-Example:
+| Component | Role |
+|---|---|
+| `ConcurrentSkipListMap<Long, String>` | Memtable storage with ordered, thread-safe inserts and lookups |
+| `ExecutorService` | Background flush and compaction workers |
+| `AtomicBoolean compactionRunning` | Prevents duplicate compaction jobs from being scheduled |
+| `synchronized (engine.sparseIndex)` | Protects shared sparse metadata updates during flush and compaction |
 
-```text
-SSTable A: 1 - 100
-SSTable B: 101 - 200
-```
-
-A lookup for:
-
-```text
-150
-```
-
-immediately skips SSTable A.
+The main write path stays in the caller thread, while flush and compaction run asynchronously. That is sufficient for the learning prototype, but it is not a claim that the whole engine is a fully hardened concurrent storage system.
 
 ---
 
-## 3. Bloom Filter Check
+## Performance
 
-Each SSTable owns its own Bloom Filter.
+The repo includes a local benchmark that writes 500,000 records and reports the following result:
 
-During reads:
+| Metric | Result |
+|---|---:|
+| Writes | 500,000 |
+| Memtable threshold | 1,000 |
+| Insert time | ~5.05 s |
+| Throughput | ~99,000 writes/sec |
+| WAL segments generated | 500 |
+| SSTables generated | 500 |
+| SSTables after compaction | 1 |
 
-```text
-Key Lookup
-    ↓
-Bloom Filter Check
-    ↓
-Probably Exists
-OR
-Definitely Not Present
-```
+This should be read as a project benchmark, not as a production database claim. The GitHub/README notes in this repo also highlight an important optimization: keeping the WAL stream open across writes was a major contributor to the observed throughput, rather than reopening the WAL file for each write.
 
-If the Bloom Filter says:
+### Benchmark note
 
-```text
-Definitely Not Present
-```
-
-AndromedaDB skips that SSTable completely.
-
-This prevents unnecessary disk scans and significantly improves read performance when many SSTables exist.
-
-Bloom Filters may return false positives but never false negatives.
-
-## Sparse Index Metadata
-
-Each SSTable stores metadata containing:
-
-```text
-Minimum Key
-Maximum Key
-File Name
-Bloom Filter
-```
-
-Example:
-
-```text
-SSTable A: 1 → 100
-SSTable B: 101 → 200
-SSTable C: 201 → 300
-```
-
-Searching for key:
-
-```text
-250
-```
-
-allows AndromedaDB to immediately skip SSTables A and B.
-
-This acts as the first optimization layer before Bloom Filters are consulted.
+This is a local single-process Java benchmark for the repository itself. It is useful for understanding the project’s write path and the effect of file I/O choices, but it should not be compared directly to optimized production storage systems.
 
 ---
 
-## 4. SSTable Scan
+## Project structure
 
-Only candidate SSTables are scanned.
-
----
-
-# Deletes
-
-Deletes use tombstones.
-
-Instead of immediately removing data:
-
-```text
-DELETE(100)
-```
-
-becomes:
-
-```text
-100 -> __DELETED__
-```
-
-This preserves deletion information across SSTables.
-
-During compaction, tombstones are discarded and deleted records disappear permanently.
+| File | Responsibility |
+|---|---|
+| `Main.java` | Benchmark driver and lifecycle entry point |
+| `StorageEngine.java` | Main orchestrator for WAL, memtable, reads, flush, and compaction state |
+| `WriteAheadLog.java` | WAL segment creation, append, replay, and cleanup |
+| `SSTable.java` | SSTable serialization, sparse metadata construction, and flush behavior |
+| `Compactor.java` | SSTable merging and tombstone-aware compaction |
+| `BloomFilter.java` | In-memory probabilistic key membership checks |
+| `SparseIndexEntry.java` | Per-file metadata: first key, last key, filename, and Bloom filter |
+| `Entry.java` | Lightweight record wrapper used for file parsing |
 
 ---
 
-# Compaction
+## Design decisions
 
-Over time many SSTables accumulate:
+The strongest choices in this project are the ones that directly match the LSM pattern:
 
-```text
-data_1.db
-data_2.db
-data_3.db
-...
-```
+- **Why WAL first?** Because the project wants recent writes to be recoverable even before their memtable is flushed.
+- **Why `ConcurrentSkipListMap`?** Because it provides ordered keys and a simple thread-safe in-memory structure for the memtable.
+- **Why immutable SSTables?** Because each flush creates a stable snapshot that is easier to reason about and easier to compact safely.
+- **Why Bloom filters?** Because they make negative lookups cheap before scanning a file.
+- **Why background flush/compaction?** Because the write path stays append-heavy and the maintenance work happens asynchronously.
+- **Why tombstones?** Because deletes need to override older values before those stale entries are physically removed by compaction.
 
-Compaction merges them into larger SSTables.
-
-Example:
-
-```text
-data_1 + data_2
-          ↓
-     compacted_1
-
-compacted_1 + data_3
-          ↓
-     compacted_2
-```
-
-Benefits:
-
-- Removes stale versions
-- Removes deleted records
-- Reduces SSTable count
-- Improves read performance
+These are practical design decisions for a teaching implementation, not a claim of full production parity.
 
 ---
 
-# WAL Recovery
+## Getting started
 
-If the database crashes:
+Requirements: a recent JDK (the project is described as Java 17+ in this repo’s documentation and compiles cleanly with a standard Java toolchain).
 
-```text
-Power Failure
-Application Crash
-System Restart
+```bash
+git clone https://github.com/rrrautela/AndromedaDB.git
+cd AndromedaDB
+javac *.java
+java Main
 ```
 
-AndromedaDB scans all WAL segments during startup.
-
-Example:
-
-```text
-wal_1.log
-wal_2.log
-wal_3.log
-```
-
-Operations are replayed in order to reconstruct the Memtable.
-
-This prevents data loss.
+Running `Main` executes the benchmark path, writes 500,000 records, triggers background flush and compaction, and performs a couple of lookups at the end.
 
 ---
 
-# Concurrency Model
+## Current limitations
 
-## Flush Thread
+This implementation is intentionally compact and educational. The repository itself highlights some important caveats:
 
-Responsible for:
+- No explicit `fsync` or file-force call before a write is considered durable.
+- No manifest or journal for metadata integrity.
+- No atomic rename for newly published files.
+- No production-grade multi-level compaction strategy.
+- No full database-level concurrency guarantees beyond the specific structures used here.
 
-```text
-Memtable -> SSTable
-```
-
-conversion.
-
----
-
-## Compaction Thread
-
-Responsible for:
-
-```text
-SSTable -> Compacted SSTable
-```
-
-merges.
+These are not gaps in the documentation; they are structural limitations of the project as implemented.
 
 ---
 
-## AtomicBoolean Guard
+## What I learned
 
-Prevents duplicate compaction jobs from being scheduled simultaneously.
+The project is a strong practical study in the mechanics behind storage-engine design:
 
----
-
-## Synchronized Sparse Index
-
-Protects shared metadata from concurrent modifications.
-
----
-
-# Performance
-
-Benchmark Configuration:
-
-```text
-500,000 Writes
-Memtable Size = 1000
-```
-
-Results:
-
-```text
-~99,000 Writes/sec
-```
-
-A major optimization involved keeping WAL segments open instead of opening and closing files for every write.
-
-This improved throughput from roughly:
-
-```text
-37,000 writes/sec
-```
-
-to:
-
-```text
-99,009 writes/sec
-```
-
-## Additional Stress Test Results
-
-```text
-500,000 Writes
-Insert Time = 5050 ms
-~99,000 Writes/sec
-500 WAL Segments Generated
-500 SSTables Generated
-Final SSTables = 1
-```
-
-This benchmark demonstrates sustained write ingestion while asynchronous flush and compaction operations execute in the background.
----
-
-# Technologies & Concepts
-
-- Java
-- ConcurrentSkipListMap
-- ExecutorService
-- AtomicBoolean
-- Bloom Filters
-- Write-Ahead Logging (WAL)
-- SSTables
-- LSM Tree Concepts
-- Background Compaction
-- File I/O
-- Crash Recovery
-
----
-# Design Decisions
-
-## Why WAL Before Memtable?
-
-Durability.
-
-Every write is first recorded in the Write-Ahead Log before reaching memory. If the process crashes, WAL segments can be replayed to reconstruct lost Memtable state.
-
-## Why Bloom Filters?
-
-Disk I/O is expensive.
-
-Before scanning an SSTable, AndromedaDB first checks its Bloom Filter.
-
-The Bloom Filter can quickly determine whether a key is:
-
-- Definitely Not Present
-- Possibly Present
-
-If the Bloom Filter reports that a key is definitely not present, the SSTable is skipped entirely, avoiding unnecessary disk reads.
-
-Bloom Filters may produce false positives but never false negatives, making them an efficient way to reduce read amplification when many SSTables exist.
- 
-## Why Immutable SSTables?
-
-Immutable files eliminate update-in-place complexity, simplify crash recovery, and make background compaction possible without interfering with active writes.
-
-
-## Why Background Flush?
-
-Serializing a Memtable to disk can be expensive. By flushing in a background thread, incoming writes continue with minimal latency.
-
-## Why Background Compaction?
-
-Compaction rewrites and merges SSTables, making it one of the most expensive operations in an LSM-based system. Running it asynchronously prevents write stalls.
-
-## Why ConcurrentSkipListMap?
-
-ConcurrentSkipListMap provides:
-
-- Sorted key ordering
-- Thread-safe access
-- Efficient inserts
-- Future support for range queries
-
-making it a natural fit for a Memtable implementation.
+- WALs are a simple, effective way to recover recent writes.
+- LSM systems optimize for append-heavy ingestion and accept more complexity on read/maintenance paths.
+- Compaction is a real operational cost, not just a cleanup step.
+- File I/O patterns strongly influence throughput.
+- Probabilistic filtering can dramatically reduce useless reads when used appropriately.
 
 ---
 
-# Future Improvements
+## Interview relevance
 
-The current implementation focuses on the core storage-engine building blocks used by modern LSM databases. Future enhancements could include:
+This repo is a useful example for discussing:
 
-- Multi-Level Compaction (L0 → L1 → L2 → L3)
-- Sparse Index Offsets for direct SSTable seeks
-- Binary Search Within SSTables
-- Block-Based SSTable Indexes
-- SSTable Compression
-- Range Query Optimization
-- Multi-Threaded Compaction Pipelines
-- Distributed Replication
-- Consensus Protocol Integration (Raft/Paxos)
-- Metrics & Observability Dashboard
-- MVCC (Multi-Version Concurrency Control)
-- Read Caching Layer
-- Bloom Filter Tuning & Adaptive Sizing
+- storage-engine fundamentals
+- WAL and recovery semantics
+- LSM write/read trade-offs
+- file-based data structures and serialization
+- concurrency with executors and shared metadata
+- performance tuning through I/O behavior
+
+It is especially relevant for backend, systems, and storage-engine interviews where the candidate is expected to reason from actual implementation details rather than generic database theory.
 
 ---
 
-# Key Takeaway
+## Connect
 
-AndromedaDB demonstrates the core ideas behind modern write-optimized storage engines by combining:
+Built by Harshit.
 
-```text
-Write-Ahead Log (WAL)
-        +
-Memtable
-        +
-Immutable SSTables
-        +
-Bloom Filters
-        +
-Background Flush
-        +
-Background Compaction
-```
-
-into a durable, scalable, and high-throughput storage engine capable of sustaining approximately **99,000 writes/sec during a 500,000-write benchmark** while performing asynchronous flush and compaction operations in the background.
+- LinkedIn: [linkedin.com/in/rrrautela](https://linkedin.com/in/rrrautela)
+- Email: hs.rautela11@gmail.com
